@@ -1,0 +1,248 @@
+
+# 🚀 AWS ALB + Private Ubuntu EC2s + Auto Scaling — Complete Guide
+
+> **Key difference from Amazon Linux:** Ubuntu uses `apt` & `apache2` instead of `yum` & `httpd`
+
+***
+
+## 🗺️ Architecture
+
+```
+🌐 Internet
+      │
+      ▼
+🔀 Internet Gateway (1)
+      │
+      ▼
+⚖️ ALB — Public Subnets (AZ-1a, AZ-1b)
+      │
+      ▼
+🎯 Private Target Group (1)
+   ├── 🖥️ Private EC2 #1 Ubuntu  (Private-Subnet-1a)
+   └── 🖥️ Private EC2 #2 Ubuntu  (Private-Subnet-1b)
+               │
+               ▼
+   🔁 NAT Gateway (1) → Internet Gateway (outbound only)
+
+📈 Auto Scaling Group → Target Tracking + Step Scaling (20% CPU)
+```
+
+***
+
+## 🏗️ Step 1 — Create VPC
+
+- Go to **VPC → Your VPCs → Create VPC**
+- Name: `My-VPC`
+- CIDR: `10.0.0.0/16`
+
+***
+
+## 🌐 Step 2 — Create Subnets
+
+Go to **VPC → Subnets → Create Subnet** and create all 4:
+
+| 🏷️ Name | 🔒 Type | 📡 CIDR | 🗺️ AZ |
+|---|---|---|---|
+| Public-Subnet-1 | Public | 10.0.1.0/24 | ap-south-1a |
+| Public-Subnet-2 | Public | 10.0.2.0/24 | ap-south-1b |
+| Private-Subnet-1 | Private | 10.0.3.0/24 | ap-south-1a |
+| Private-Subnet-2 | Private | 10.0.4.0/24 | ap-south-1b |
+
+> ⚠️ ALB requires **2 public subnets** in different AZs
+
+***
+
+## 🔀 Step 3 — Internet Gateway
+
+1. **VPC → Internet Gateways → Create** → Name: `My-IGW`
+2. **Actions → Attach to VPC** → select `My-VPC`
+3. Create a **Public Route Table**:
+   - Add route: `0.0.0.0/0` → `My-IGW`
+   - Associate `Public-Subnet-1` and `Public-Subnet-2` ✅
+
+***
+
+## 🔁 Step 4 — NAT Gateway
+
+1. **VPC → NAT Gateways → Create NAT Gateway**
+2. Subnet: **Public-Subnet-1** *(must be public)*
+3. Connectivity: **Public**
+4. Click **Allocate Elastic IP** → **Create**
+5. Create a **Private Route Table**:
+   - Add route: `0.0.0.0/0` → `NAT Gateway`
+   - Associate `Private-Subnet-1` and `Private-Subnet-2` ✅
+
+***
+
+## 🔐 Step 5 — Security Groups
+
+**🛡️ ALB Security Group (`alb-sg`):**
+- Inbound: HTTP `80` from `0.0.0.0/0`
+
+**🛡️ EC2 Security Group (`private-ec2-sg`):**
+- Inbound: HTTP `80` from `alb-sg` only
+- Outbound: All traffic *(needed for apt updates via NAT)*
+
+***
+
+## 📋 Step 6 — Launch Template (Ubuntu)
+
+1. **EC2 → Launch Templates → Create Launch Template**
+2. 🖼️ **AMI**: Ubuntu Server 22.04 LTS (64-bit x86)
+3. 💻 **Instance type**: `t2.micro`
+4. 🔐 **Security group**: `private-ec2-sg`
+5. 🚫 **Do NOT assign public IP**
+6. 👤 **IAM Instance Profile**: Attach `AmazonSSMManagedInstanceCore`
+7. 📝 **User Data** — paste this script:
+
+```bash
+#!/bin/bash
+apt update -y
+apt install -y apache2
+systemctl start apache2
+systemctl enable apache2
+echo "<h1>Hello from Ubuntu Server: $(hostname -f)</h1>" > /var/www/html/index.html
+```
+
+> ⚠️ **Ubuntu difference**: Use `apt` not `yum`, service name is `apache2` not `httpd`
+
+***
+
+## 🎯 Step 7 — Create Private Target Group
+
+1. **EC2 → Target Groups → Create Target Group**
+2. Target type: **Instances**
+3. Protocol: `HTTP`, Port: `80`
+4. VPC: `My-VPC`
+5. Health check: Protocol `HTTP`, path `/`
+6. 🚫 **Do NOT register targets** — ASG handles this automatically
+
+***
+
+## ⚖️ Step 8 — Create ALB
+
+1. **EC2 → Load Balancers → Create → Application Load Balancer**
+2. Name: `My-ALB`
+3. Scheme: **Internet-facing**
+4. IP type: `IPv4`
+5. VPC: `My-VPC`
+6. 🌐 Subnets: `Public-Subnet-1` and `Public-Subnet-2` *(public only)*
+7. Security Group: `alb-sg`
+8. Listener: HTTP `80` → Forward to **Private Target Group**
+9. Click **Create** ✅
+
+***
+
+## 📈 Step 9 — Auto Scaling Group
+
+1. **EC2 → Auto Scaling Groups → Create**
+2. Name: `My-ASG`
+3. Launch Template: from Step 6
+4. VPC: `My-VPC`
+5. Subnets: `Private-Subnet-1` and `Private-Subnet-2`
+6. Load balancing: Attach to existing **Target Group**
+7. Health check type: **ELB**
+8. ⚙️ Capacity:
+   - Minimum: `1`
+   - Desired: `2`
+   - Maximum: `4`
+9. Click **Create Auto Scaling Group** ✅
+
+***
+
+## 🎯 Step 10 — Target Tracking Scaling Policy
+
+**ASG → Automatic Scaling → Create Dynamic Scaling Policy:**
+
+- Policy type: **Target tracking scaling**
+- 📊 Metric: `Average CPU utilization`
+- 🎯 Target value: **`20`%**
+- ⏱️ Scale-out cooldown: `60` sec
+- ⏱️ Scale-in cooldown: `300` sec
+- Click **Create** ✅
+
+> 🤖 AWS auto-creates 2 CloudWatch alarms (`AlarmHigh` & `AlarmLow`) for you
+
+***
+
+## 🔔 Step 11 — CloudWatch Alarms for Step Scaling
+
+### 📈 Scale-Out Alarm (`High-CPU-Alarm`)
+
+1. **CloudWatch → Alarms → Create Alarm**
+2. Metric: `EC2 → By Auto Scaling Group → CPUUtilization` → select `My-ASG`
+3. Statistic: `Average`, Period: `1 minute`
+4. Condition: **Greater than `20`%**
+5. Name: `High-CPU-Alarm` → **Create** ✅
+
+### 📉 Scale-In Alarm (`Low-CPU-Alarm`)
+
+- Same steps, Condition: **Less than `10`%**
+- Name: `Low-CPU-Alarm` → **Create** ✅
+
+***
+
+## 📊 Step 12 — Step Scaling Policy
+
+**ASG → Automatic Scaling → Create Dynamic Scaling Policy:**
+
+### 📈 Scale-Out Policy
+- Policy type: **Step scaling**
+- Alarm: `High-CPU-Alarm`
+
+| 🌡️ CPU Range | ⚙️ Action |
+|---|---|
+| 20% – 40% | ➕ Add `1` instance |
+| 40% – 70% | ➕ Add `2` instances |
+| 70% and above | ➕ Add `3` instances |
+
+### 📉 Scale-In Policy
+- Policy type: **Step scaling**
+- Alarm: `Low-CPU-Alarm`
+
+| 🌡️ CPU Range | ⚙️ Action |
+|---|---|
+| Below 10% | ➖ Remove `1` instance |
+
+> ⚡ Step scaling **reacts immediately** when alarm fires — no cooldown wait unlike simple scaling
+
+***
+
+## ✅ Step 13 — Verify Everything
+
+- 🌐 Open **ALB DNS** in a browser → should show `Hello from Ubuntu Server: …`
+- 💚 Both private EC2s show **Healthy** in the Target Group
+- 🔒 No public IPs on EC2 instances — fully private ✅
+
+***
+
+## 🖥️ Access Private EC2s — No Bastion Needed!
+
+Use **AWS SSM Session Manager** — no SSH, no port 22:
+
+1. ✅ IAM role `AmazonSSMManagedInstanceCore` attached (done in Step 6)
+2. **Systems Manager → Session Manager → Start Session**
+3. Select your Ubuntu EC2 → click **Start**
+4. 🎉 Browser shell opens instantly!
+
+### 🧪 Test CPU Scaling on Ubuntu
+
+```bash
+# Install stress tool
+sudo apt install -y stress
+
+# Spike CPU for 5 minutes to trigger 20% alarm
+stress --cpu 4 --timeout 300
+```
+
+***
+
+## 🐧 Ubuntu vs Amazon Linux — Key Differences
+
+| 📌 Item | 🔴 Amazon Linux | 🟠 Ubuntu |
+|---|---|---|
+| 📦 Package manager | `yum` | `apt` |
+| 🌐 Web server package | `httpd` | `apache2` |
+| ⚙️ Service name | `httpd` | `apache2` |
+| 🔄 Update command | `yum update -y` | `apt update -y` |
+| 📁 Web root | `/var/www/html/` | `/var/www/html/` ✅ same |
